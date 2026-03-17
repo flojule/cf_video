@@ -3,6 +3,12 @@
 Tracks 3 CrazyFlie drones (cf1, cf2, cf3) and a hanging payload in a video.
 Uses foreground blob detection with Hungarian assignment to maintain identities across frames.
 
+![debug video](output/crazyflo_path_debug.mp4)
+
+![persistent trails](output/crazyflo_path_persistent.mp4)
+
+![transient trails](output/crazyflo_path_transient.mp4)
+
 ## Setup
 
 ```bash
