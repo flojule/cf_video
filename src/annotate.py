@@ -24,7 +24,7 @@ def _hungarian(cost: np.ndarray) -> list[tuple[int, int]]:
 
 
 # ── Configuration ──────────────────────────────────────────────────────────────
-SKIP_FFMPEG_DEFAULT   = True
+SKIP_FFMPEG_DEFAULT   = False
 LOG_TO_FILE           = True
 REWIND_FRAMES         = 150  # frames of detection history to keep for gap-fill
 SMOOTH_TRAILS         = True
@@ -1048,6 +1048,24 @@ def main(skip_ffmpeg: bool = False) -> None:
         out_p.release()
         out_t.release()
         logging.info(f"\nTrail videos → {path_p}, {path_t}")
+
+        # ── Convert persistent + transient to webm ────────────────────────────
+        if not skip_ffmpeg:
+            for src in (path_p, path_t):
+                dst = src.with_suffix(".webm")
+                try:
+                    r = subprocess.run(
+                        ["ffmpeg", "-y", "-i", str(src),
+                         "-c:v", "libvpx-vp9", "-b:v", "2M", str(dst)],
+                        capture_output=True, timeout=300,
+                    )
+                    if r.returncode == 0:
+                        logging.debug(f"Converted → {dst}")
+                    else:
+                        logging.error(f"ffmpeg failed ({src.name}): {r.stderr[:200]}")
+                except FileNotFoundError:
+                    logging.warning("ffmpeg not found; skipping webm conversion")
+                    break
     except Exception as e:
         import traceback
         logging.warning(f"Post-process failed: {e}\n{traceback.format_exc()}")
