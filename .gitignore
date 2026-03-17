@@ -2,3 +2,5 @@ __pycache__
 .claude
 venv
 *.log
+*.webm
+*.mp4

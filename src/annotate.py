@@ -644,29 +644,10 @@ def main(skip_ffmpeg: bool = False) -> None:
     cv2.imwrite(str(dbg_dir / "debug_fg_overlay_start.png"), overlay)
     logging.debug(f"Debug images → {dbg_dir}/")
 
-    # ── Video writer (debug only — full-length from frame 0) ──────────────────
-    debug_out    = str(Path(VIDEO_OUT).with_name(Path(VIDEO_OUT).stem + "_debug.mp4"))
-    fourcc_mp4   = cv2.VideoWriter.fourcc(*"mp4v")
-    debug_writer = cv2.VideoWriter(debug_out, fourcc_mp4, fps_v, (W, H))
-
-    # Write frames 0 … start_frame as raw (pre-takeoff, no overlay)
-    cap_pre = cv2.VideoCapture(proc_video)
-    cap_pre.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    for _fi in range(start_frame + 1):
-        r_pre, f_pre = cap_pre.read()
-        if not r_pre:
-            break
-        debug_writer.write(f_pre)
-    cap_pre.release()
-    logging.debug(f"Pre-tracking frames 0→{start_frame} written to debug video")
+    fourcc_mp4 = cv2.VideoWriter.fourcc(*"mp4v")
 
     # Reset main capture to start_frame + 1 (first_frame already consumed)
     cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame + 1)
-
-    # Legacy trail-overlay writer (kept for compatibility; not primary output)
-    out_writer = cv2.VideoWriter(
-        VIDEO_OUT, fourcc_mp4, fps_v, (W, H),
-    )
 
     # ── Per-agent state ────────────────────────────────────────────────────────
     # trail:      [(cx, cy), …] accumulated centroid path
@@ -704,6 +685,10 @@ def main(skip_ffmpeg: bool = False) -> None:
     cv2.namedWindow("Tracking", cv2.WINDOW_NORMAL)
     cv2.resizeWindow("Tracking", 1600, 900)
     logging.debug(f"Tracking frames {start_frame}→{end_frame or total - 1}")
+
+    # Debug writer covers only the tracked segment (start_frame → end_frame)
+    debug_out    = str(Path(VIDEO_OUT).with_name(Path(VIDEO_OUT).stem + "_debug.mp4"))
+    debug_writer = cv2.VideoWriter(debug_out, fourcc_mp4, fps_v, (W, H))
 
     while True:
         if end_frame is not None and frame_idx > end_frame:
@@ -892,8 +877,6 @@ def main(skip_ffmpeg: bool = False) -> None:
         render_trails(trail_canvas, trails, show_trail)
 
         annotated = blend_trail(frame, trail_canvas, ALPHA) if show_trail else frame.copy()
-        out_writer.write(annotated)
-
         dbg = draw_debug(annotated, states, frame_idx, total, fps_v)
         debug_writer.write(dbg)
         cv2.imshow("Tracking", dbg)
@@ -910,34 +893,10 @@ def main(skip_ffmpeg: bool = False) -> None:
     sys.stdout.write("\r  tracking 100%\n")
     sys.stdout.flush()
 
-    # Write remaining frames (end_frame+1 → total) as raw to debug video
-    while True:
-        r_post, f_post = cap.read()
-        if not r_post:
-            break
-        debug_writer.write(f_post)
-
     cap.release()
-    out_writer.release()
     debug_writer.release()
     cv2.destroyAllWindows()
-    logging.info(f"\nTracking done → {VIDEO_OUT}  debug → {debug_out}")
-
-    # ── FFmpeg webm conversion ─────────────────────────────────────────────────
-    if not skip_ffmpeg:
-        webm = VIDEO_OUT.rsplit(".", 1)[0] + ".webm"
-        try:
-            r = subprocess.run(
-                ["ffmpeg", "-y", "-i", VIDEO_OUT,
-                 "-c:v", "libvpx-vp9", "-b:v", "2M", webm],
-                capture_output=True, timeout=300,
-            )
-            if r.returncode == 0:
-                logging.debug(f"Converted → {webm}")
-            else:
-                logging.error(f"ffmpeg failed: {r.stderr[:200]}")
-        except FileNotFoundError:
-            logging.warning("ffmpeg not found; skipping webm conversion")
+    logging.info(f"Debug → {debug_out}")
 
     # ── Temp cleanup ───────────────────────────────────────────────────────────
     if temp_mp4:
@@ -946,129 +905,31 @@ def main(skip_ffmpeg: bool = False) -> None:
         except Exception:
             pass
 
-    # ── Post-process: full-length persistent / transient videos ───────────────
-    try:
-        stem   = Path(VIDEO_OUT).stem
-        parent = Path(VIDEO_OUT).parent
-        path_p = parent / (stem + "_persistent.mp4")
-        path_t = parent / (stem + "_transient.mp4")
-
-        # Use the same trail data as the debug / path videos (full_trail_log):
-        # no gap-fill, no spline smoothing.
-        # Frame range in which trails are visible
-        trail_start_frame = int(trail_start_sec * fps_v)
-        trail_end_frame   = total - int(trail_end_sec * fps_v)
-
-        # Pre-sort trail sequences once for O(n) per-frame access
-        cleaned_seq: dict[str, list[tuple[int, tuple[int, int]]]] = {
-            name: sorted(fd.items())
+    # ── Export tracking data for post-processing ───────────────────────────────
+    data_out = str(Path(VIDEO_OUT).with_name(Path(VIDEO_OUT).stem + "_tracking.json"))
+    tracking_data = {
+        "video_in":        VIDEO_IN,
+        "fps":             fps_v,
+        "total_frames":    total,
+        "width":           W,
+        "height":          H,
+        "start_frame":     start_frame,
+        "end_frame":       end_frame,
+        "trail_start_sec": trail_start_sec,
+        "trail_end_sec":   trail_end_sec,
+        "trail_color":     {k: list(v) for k, v in TRAIL_COLOR.items()},
+        "trail_thickness": TRAIL_THICKNESS,
+        "alpha":           ALPHA,
+        "trail_window":    TRAIL_WINDOW,
+        "smooth_trails":   SMOOTH_TRAILS,
+        "trails": {
+            name: {str(fi): list(pt) for fi, pt in fd.items()}
             for name, fd in full_trail_log.items()
-        }
-
-        # Dynamic transient window: estimate frames for payload to cross the screen.
-        # Use the payload's median step speed; window = 0.65 × (W / speed).
-        # This keeps the transient tail shorter than one full oscillation.
-        transient_window = TRAIL_WINDOW
-        payload_seq = cleaned_seq.get("payload", [])
-        if len(payload_seq) >= 10:
-            steps = [
-                ((payload_seq[k + 1][1][0] - payload_seq[k][1][0]) ** 2
-                 + (payload_seq[k + 1][1][1] - payload_seq[k][1][1]) ** 2) ** 0.5
-                for k in range(len(payload_seq) - 1)
-            ]
-            valid_steps = [d for d in steps if d > 0.1]
-            if valid_steps:
-                avg_speed = float(np.median(valid_steps))
-                transient_window = max(20, int(W / avg_speed * 0.65))
-                logging.debug(
-                    f"Transient window: {transient_window} frames "
-                    f"(payload median speed {avg_speed:.1f} px/frame)"
-                )
-
-        # Running head pointer per agent — where persistent trail ends
-        head: dict[str, int] = {name: 0 for name in cleaned_seq}
-
-        cap2  = cv2.VideoCapture(proc_video)
-        cap2.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        out_p = cv2.VideoWriter(str(path_p), fourcc_mp4, fps_v, (W, H))
-        out_t = cv2.VideoWriter(str(path_t), fourcc_mp4, fps_v, (W, H))
-
-        for fi in range(total):
-            r2, f2 = cap2.read()
-            if not r2:
-                break
-
-            show_trail = trail_start_frame <= fi <= trail_end_frame
-
-            if not show_trail:
-                out_p.write(f2)
-                out_t.write(f2)
-                continue
-
-            # Advance head pointers to include all frames up to fi
-            for name, seq in cleaned_seq.items():
-                while head[name] < len(seq) and seq[head[name]][0] <= fi:
-                    head[name] += 1
-
-            # ── Persistent: all trail points up to current frame ──────────────
-            cp = np.zeros((H, W, 3), dtype=np.uint8)
-            for name, seq in cleaned_seq.items():
-                # Only points within the trail visibility window
-                pts = [pt for f, pt in seq[:head[name]]
-                       if f >= trail_start_frame]
-                if len(pts) >= 2:
-                    cv2.polylines(cp, [np.array(pts, dtype=np.int32)],
-                                  False, TRAIL_COLOR[name], TRAIL_THICKNESS)
-            out_p.write(blend_trail(f2, cp, ALPHA))
-
-            # ── Transient: last transient_window frames, fading polyline ─────
-            ct = np.zeros((H, W, 3), dtype=np.uint8)
-            for name, seq in cleaned_seq.items():
-                window = [(f, pt) for f, pt in seq[:head[name]]
-                          if fi - transient_window <= f]
-                if len(window) < 2:
-                    continue
-                # Draw each consecutive segment with brightness fading by age
-                for k in range(len(window) - 1):
-                    f_a, pt_a = window[k]
-                    f_b, pt_b = window[k + 1]
-                    age = fi - f_b
-                    w   = max(0.0, 1.0 - age / transient_window)
-                    col = tuple(int(c * w) for c in TRAIL_COLOR[name])
-                    cv2.line(ct, pt_a, pt_b, col, TRAIL_THICKNESS)
-            out_t.write(blend_trail(f2, ct, ALPHA))
-
-            if fi % 30 == 0:
-                sys.stdout.write(f"\r  trail {100*fi/total:.0f}%")
-                sys.stdout.flush()
-
-        sys.stdout.write("\r  trail 100%\n")
-        sys.stdout.flush()
-        cap2.release()
-        out_p.release()
-        out_t.release()
-        logging.info(f"\nTrail videos → {path_p}, {path_t}")
-
-        # ── Convert persistent + transient to webm ────────────────────────────
-        if not skip_ffmpeg:
-            for src in (path_p, path_t):
-                dst = src.with_suffix(".webm")
-                try:
-                    r = subprocess.run(
-                        ["ffmpeg", "-y", "-i", str(src),
-                         "-c:v", "libvpx-vp9", "-b:v", "2M", str(dst)],
-                        capture_output=True, timeout=300,
-                    )
-                    if r.returncode == 0:
-                        logging.debug(f"Converted → {dst}")
-                    else:
-                        logging.error(f"ffmpeg failed ({src.name}): {r.stderr[:200]}")
-                except FileNotFoundError:
-                    logging.warning("ffmpeg not found; skipping webm conversion")
-                    break
-    except Exception as e:
-        import traceback
-        logging.warning(f"Post-process failed: {e}\n{traceback.format_exc()}")
+        },
+    }
+    with open(data_out, "w") as f:
+        json.dump(tracking_data, f)
+    logging.info(f"Tracking data → {data_out}")
 
 
 if __name__ == "__main__":
